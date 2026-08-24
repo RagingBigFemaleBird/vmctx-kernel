@@ -883,6 +883,15 @@ void switch_fpu_return(void)
 
 	fpregs_restore_userregs();
 }
+/*
+ * vmctx enters guest mode on this CPU just as KVM does, and must load the
+ * task's FPU registers before it does — the guest *is* the task's user
+ * context, so running it with another task's registers hands the program
+ * values nothing wrote. Same need, same symbols, so the same permission:
+ * on 6.18.35 that permission is still the plain EXPORT_SYMBOL_GPL below,
+ * which already covers vmctx — this kernel has no per-module allow-list on
+ * the FPU symbols for vmctx to be named in.
+ */
 EXPORT_SYMBOL_GPL(switch_fpu_return);
 
 void fpregs_lock_and_load(void)
@@ -918,6 +927,15 @@ void fpregs_assert_state_consistent(void)
 
 	WARN_ON_FPU(!fpregs_state_valid(fpu, smp_processor_id()));
 }
+/*
+ * vmctx enters guest mode on this CPU just as KVM does, and must load the
+ * task's FPU registers before it does — the guest *is* the task's user
+ * context, so running it with another task's registers hands the program
+ * values nothing wrote. Same need, same symbols, so the same permission:
+ * on 6.18.35 that permission is still the plain EXPORT_SYMBOL_GPL below,
+ * which already covers vmctx — this kernel has no per-module allow-list on
+ * the FPU symbols for vmctx to be named in.
+ */
 EXPORT_SYMBOL_GPL(fpregs_assert_state_consistent);
 #endif
 

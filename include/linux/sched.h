@@ -86,6 +86,7 @@ struct signal_struct;
 struct task_delay_info;
 struct task_group;
 struct task_struct;
+struct vmctx_task;
 struct user_event_mm;
 
 #include <linux/sched/ext.h>
@@ -962,6 +963,10 @@ struct task_struct {
 	struct mm_struct		*mm;
 	struct mm_struct		*active_mm;
 	struct address_space		*faults_disabled_mapping;
+
+	/* Native VM context (avm.md project): non-NULL if this task is a VM
+	 * context running a hardware guest via vmctx_run(2). See <linux/vmctx.h>. */
+	struct vmctx_task		*vmctx;
 
 	int				exit_state;
 	int				exit_code;

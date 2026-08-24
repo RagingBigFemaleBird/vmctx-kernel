@@ -382,6 +382,9 @@ asmlinkage long sys_file_getattr(int dfd, const char __user *filename,
 asmlinkage long sys_file_setattr(int dfd, const char __user *filename,
 				 struct file_attr __user *attr, size_t usize,
 				 unsigned int at_flags);
+struct vmctx_run_config;
+asmlinkage long sys_vmctx_run(struct vmctx_run_config __user *ucfg);
+asmlinkage long sys_vmctx_ctl(pid_t pid, unsigned int cmd, void __user *arg);
 asmlinkage long sys_getcwd(char __user *buf, unsigned long size);
 asmlinkage long sys_eventfd2(unsigned int count, int flags);
 asmlinkage long sys_epoll_create1(int flags);

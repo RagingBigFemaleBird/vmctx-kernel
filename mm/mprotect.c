@@ -38,6 +38,7 @@
 #include <asm/tlbflush.h>
 #include <asm/tlb.h>
 
+#include <linux/vmctx.h>
 #include "internal.h"
 
 static bool maybe_change_pte_writable(struct vm_area_struct *vma, pte_t pte)
@@ -1010,6 +1011,24 @@ SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,
 {
 	return do_mprotect_pkey(start, len, prot, -1);
 }
+
+/*
+ * mprotect() for a vmctx context, applied to its own address space.
+ *
+ * A vmctx guest's memory syscalls are performed on the machine that owns the
+ * program; the resulting protection then has to be applied to the machine the
+ * program runs on. That has to happen in the context's own task -- there is no
+ * remote mprotect, and mm switching is not available to a task that has an mm
+ * of its own -- so the context applies it on its way back into the guest, which
+ * is here. Re-mapping the range instead would work only where the pages live in
+ * a shared object, and would silently discard the contents of anything mapped
+ * privately, the loader's relocated GOT among them.
+ */
+long vmctx_mprotect(unsigned long start, size_t len, unsigned long prot)
+{
+	return do_mprotect_pkey(start, len, prot, -1);
+}
+EXPORT_SYMBOL_GPL(vmctx_mprotect);
 
 #ifdef CONFIG_ARCH_HAS_PKEYS
 

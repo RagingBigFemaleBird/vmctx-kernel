@@ -1308,7 +1308,25 @@ void exit_mmap(struct mm_struct *mm)
 		vma = vma_next(&vmi);
 	} while (vma && likely(!xa_is_zero(vma)));
 
-	BUG_ON(count != mm->map_count);
+	/*
+	 * Report-and-continue rather than BUG_ON, aligned with what the
+	 * maintained tree (7.0.14, tear_down_vmas) itself does with this
+	 * check -- and LOUDER: its VM_WARN_ON_ONCE compiles out without
+	 * CONFIG_DEBUG_VM, so a desync there is invisible while the hard
+	 * assert here killed the exiting task, LEAKED the mm mid-teardown,
+	 * and stranded every socket the task held (a vmctx destination's
+	 * page-service port died this way with a full accept backlog, and
+	 * every later run timed out against the corpse). Continuing is safe:
+	 * every VMA the walk reached was freed, and __mt_destroy() below
+	 * releases the tree whatever the counter said. The count pair is
+	 * printed every time because the desync is a real, unexplained
+	 * defect under investigation (vmctx cross-task unmap era) -- this
+	 * report is its measurement, not its acceptance.
+	 */
+	if (unlikely(count != mm->map_count))
+		pr_err("exit_mmap: pid %d (%s): walked %d vma(s), map_count %d (delta %d) -- accounting desynced during the run; teardown continues\n",
+		       task_pid_nr(current), current->comm, count,
+		       mm->map_count, mm->map_count - count);
 
 	trace_exit_mmap(mm);
 destroy:

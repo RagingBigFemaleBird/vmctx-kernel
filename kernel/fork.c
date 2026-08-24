@@ -20,6 +20,7 @@
 #include <linux/sched/numa_balancing.h>
 #include <linux/sched/stat.h>
 #include <linux/sched/task.h>
+#include <linux/vmctx.h>
 #include <linux/sched/task_stack.h>
 #include <linux/sched/cputime.h>
 #include <linux/sched/ext.h>
@@ -2015,6 +2016,12 @@ __latent_entropy struct task_struct *copy_process(
 	p = dup_task_struct(current, node);
 	if (!p)
 		goto fork_out;
+	/*
+	 * dup_task_struct() copied task_struct wholesale, so p currently holds
+	 * the parent's VM-context pointer. Clear it before any error path can
+	 * run; vmctx_copy_task() below installs the child's own copy.
+	 */
+	p->vmctx = NULL;
 	p->flags &= ~PF_KTHREAD;
 	if (args->kthread)
 		p->flags |= PF_KTHREAD;
@@ -2191,6 +2198,11 @@ __latent_entropy struct task_struct *copy_process(
 	if (retval)
 		goto bad_fork_cleanup_namespaces;
 	retval = copy_thread(p, args);
+	if (retval)
+		goto bad_fork_cleanup_io;
+
+	/* Give the child its own copy of the VM context, if the parent is one. */
+	retval = vmctx_copy_task(p, current, clone_flags);
 	if (retval)
 		goto bad_fork_cleanup_io;
 

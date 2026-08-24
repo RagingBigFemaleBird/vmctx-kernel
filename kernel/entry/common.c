@@ -23,7 +23,7 @@ __always_inline unsigned long exit_to_user_mode_loop(struct pt_regs *regs,
 	 * Before returning to user space ensure that all pending work
 	 * items have been completed.
 	 */
-	while (ti_work & EXIT_TO_USER_MODE_WORK) {
+	while ((ti_work & EXIT_TO_USER_MODE_WORK) || vmctx_should_run(current)) {
 
 		local_irq_enable_exit_to_user(ti_work);
 
@@ -36,7 +36,17 @@ __always_inline unsigned long exit_to_user_mode_loop(struct pt_regs *regs,
 		if (ti_work & _TIF_PATCH_PENDING)
 			klp_update_patch_state(current);
 
-		if (ti_work & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL))
+		/*
+		 * Native VM context (avm.md): a service context holds a
+		 * program whose instructions run on another machine, so this
+		 * frame is not where that program is except while a forwarded
+		 * syscall is being performed. A signal delivered here at any
+		 * other moment writes its frame into memory the program is not
+		 * standing on and is then lost. vmctx_defer_signal_work() holds
+		 * it until the call that gives it somewhere to go.
+		 */
+		if ((ti_work & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL)) &&
+		    !vmctx_defer_signals(current, ti_work))
 			arch_do_signal_or_restart(regs);
 
 		if (ti_work & _TIF_NOTIFY_RESUME)
@@ -44,6 +54,18 @@ __always_inline unsigned long exit_to_user_mode_loop(struct pt_regs *regs,
 
 		/* Architecture specific TIF work */
 		arch_exit_to_user_mode_work(regs, ti_work);
+
+		/*
+		 * Native VM context (avm.md): if this task is a VM context,
+		 * enter its guest once here. Interrupts are enabled, so a
+		 * guest VMEXIT taken as a host interrupt (e.g. the timer) is
+		 * serviced normally; if it set need_resched the loop's
+		 * schedule() above switches this task out with the guest
+		 * suspended in its VMCB — i.e. VM enter/exit happen at the
+		 * context-switch boundary.
+		 */
+		if (vmctx_should_run(current))
+			vmctx_guest_step(regs);
 
 		/*
 		 * Disable interrupts and reevaluate the work flags as they

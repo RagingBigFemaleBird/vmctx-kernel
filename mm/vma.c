@@ -1304,7 +1304,22 @@ static void vms_complete_munmap_vmas(struct vma_munmap_struct *vms,
 	struct vm_area_struct *vma;
 	struct mm_struct *mm;
 
-	mm = current->mm;
+	/*
+	 * The mm the vmas belong to, which for an ordinary munmap is
+	 * current->mm -- but NOT for vmctx, whose VMCTX_CTL_APPLYMAP unmaps a
+	 * range out of ANOTHER task's address space (the monitor tearing a
+	 * guest context's stale mapping after a forwarded munmap or exec),
+	 * with current->mm being the monitor's. Decrementing the monitor's
+	 * map_count / locked_vm / total_vm / *_vm for vmas that actually left
+	 * the guest's maple tree is a zero-sum accounting desync between the
+	 * two mms -- exit_mmap's BUG_ON/map_count check catches it (mu1/mu2, a
+	 * real cross-task unmap, desync; th9's ZAP, which removes no vma, does
+	 * not). vms->vma is one of the vmas being unmapped, so its vm_mm is
+	 * the target -- the same field vms_gather_munmap_vmas already reads
+	 * for its map_count limit check; when vma_count is 0 nothing is
+	 * decremented and current->mm is a harmless fallback.
+	 */
+	mm = vms->vma ? vms->vma->vm_mm : current->mm;
 	mm->map_count -= vms->vma_count;
 	mm->locked_vm -= vms->locked_vm;
 	if (vms->unlock)

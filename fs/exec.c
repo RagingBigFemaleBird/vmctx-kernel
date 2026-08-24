@@ -38,6 +38,7 @@
 #include <linux/sched/signal.h>
 #include <linux/sched/numa_balancing.h>
 #include <linux/sched/task.h>
+#include <linux/vmctx.h>
 #include <linux/pagemap.h>
 #include <linux/perf_event.h>
 #include <linux/highmem.h>
@@ -1287,6 +1288,15 @@ int begin_new_exec(struct linux_binprm * bprm)
 		bprm->executable = NULL;
 		bprm->execfd = retval;
 	}
+
+	/*
+	 * If this task is a VM context, the address space its guest was running
+	 * on has just been replaced. Mark the context so the guest is rebuilt at
+	 * the new program's entry point — i.e. the exec'd program runs inside
+	 * the VM context.
+	 */
+	vmctx_exec_notify(me);
+
 	return 0;
 
 out_unlock:

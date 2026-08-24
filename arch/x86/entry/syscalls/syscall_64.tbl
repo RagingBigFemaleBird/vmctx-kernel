@@ -394,6 +394,8 @@
 467	common	open_tree_attr		sys_open_tree_attr
 468	common	file_getattr		sys_file_getattr
 469	common	file_setattr		sys_file_setattr
+470	common	vmctx_run		sys_vmctx_run
+471	common	vmctx_ctl		sys_vmctx_ctl
 
 #
 # Due to a historical design error, certain syscalls are numbered differently

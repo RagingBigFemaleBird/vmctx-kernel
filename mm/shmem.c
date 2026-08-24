@@ -26,6 +26,7 @@
 #include <linux/vfs.h>
 #include <linux/mount.h>
 #include <linux/ramfs.h>
+#include <linux/vmctx.h>
 #include <linux/pagemap.h>
 #include <linux/file.h>
 #include <linux/fileattr.h>
@@ -434,7 +435,19 @@ static void shmem_free_inode(struct super_block *sb, size_t freed_ispace)
  *
  * Return: true if swapped was incremented from 0, for shmem_writeout().
  */
-static bool shmem_recalc_inode(struct inode *inode, long alloced, long swapped)
+/*
+ * Not static: vmctx_ctl_takeobj() removes a folio from a shmem object by hand
+ * -- filemap_remove_folio() under the folio lock, which is what closes the
+ * hand-over window shmem_truncate_range()'s own lock dance leaves open -- and
+ * must then do the accounting shmem_undo_range() would have done. Skipping it
+ * leaks the inode's alloced count once per hand-over.
+ *
+ * Upstream reaches the same conclusion later: in 7.0.14 this function is
+ * already non-static in the vanilla tree, and vmctx on that kernel simply
+ * declares it. This is that same one-word change, made here so both kernels
+ * carry the same vmctx code.
+ */
+bool shmem_recalc_inode(struct inode *inode, long alloced, long swapped)
 {
 	struct shmem_inode_info *info = SHMEM_I(inode);
 	bool first_swapped = false;
@@ -2536,6 +2549,11 @@ repeat:
 	 * Fast cache lookup and swap lookup did not find it: allocate.
 	 */
 
+	/* A VM context's object: a foreign read of a hole must not create it. */
+	if (unlikely(atomic_read(&vmctx_nr_active)) &&
+	    !vmctx_shmem_may_alloc(inode->i_mapping, index, vmf))
+		return -EFAULT;
+
 	if (vma && userfaultfd_missing(vma)) {
 		*fault_type = handle_userfault(vmf, VM_UFFD_MISSING);
 		return 0;
@@ -2571,6 +2589,10 @@ repeat:
 
 alloced:
 	alloced = true;
+	/* A VM context's memory: every folio created in its object is recorded. */
+	if (unlikely(atomic_read(&vmctx_nr_active)))
+		vmctx_shmem_alloced(inode->i_mapping, folio, vmf,
+				    sgp == SGP_WRITE, sgp == SGP_FALLOC);
 	if (folio_test_large(folio) &&
 	    DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE) <
 					folio_next_index(folio)) {

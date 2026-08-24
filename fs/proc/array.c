@@ -454,6 +454,8 @@ int proc_pid_status(struct seq_file *m, struct pid_namespace *ns,
 	}
 	task_sig(m, task);
 	task_cap(m, task);
+	/* Native VM context (avm.md): show whether this task is a VM context. */
+	seq_printf(m, "VmCtx:\t%d\n", task->vmctx ? 1 : 0);
 	task_seccomp(m, task);
 	task_cpus_allowed(m, task);
 	cpuset_task_status_allowed(m, task);

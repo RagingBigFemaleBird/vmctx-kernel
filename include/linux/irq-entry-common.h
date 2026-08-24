@@ -8,6 +8,7 @@
 #include <linux/tick.h>
 #include <linux/kmsan.h>
 #include <linux/unwind_deferred.h>
+#include <linux/vmctx.h>
 
 #include <asm/entry-common.h>
 
@@ -221,7 +222,7 @@ static __always_inline void exit_to_user_mode_prepare(struct pt_regs *regs)
 	tick_nohz_user_enter_prepare();
 
 	ti_work = read_thread_flags();
-	if (unlikely(ti_work & EXIT_TO_USER_MODE_WORK))
+	if (unlikely(ti_work & EXIT_TO_USER_MODE_WORK) || vmctx_should_run(current))
 		ti_work = exit_to_user_mode_loop(regs, ti_work);
 
 	arch_exit_to_user_mode_prepare(regs, ti_work);

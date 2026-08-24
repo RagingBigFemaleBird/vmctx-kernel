@@ -128,7 +128,20 @@ extern int mmap_rnd_compat_bits __read_mostly;
  * related to the physical page in case of virtualization.
  */
 #ifndef mm_forbids_zeropage
-#define mm_forbids_zeropage(X)	(0)
+/*
+ * vmctx: never the shared zero page in an adopted address space, by any
+ * road (anon fault, THP, migration, userfaultfd all funnel through this
+ * macro). The zero page is PG_reserved with a global refcount, so once it
+ * is installed at an address whose real bytes live on the other machine,
+ * no TAKE can ever move it -- vmctx_ctl_take() names that refusal
+ * terminal -- and the page serve answers "ask again" forever (pg2's hang:
+ * the stamper's first stack fault livelocked to the run limit). An
+ * ordinary zeroed folio serves the same read and can change hands. This
+ * is the door s390 uses to keep the zero page out of KVM guest mms.
+ */
+struct mm_struct;
+bool vmctx_mm_forbids_zeropage(struct mm_struct *mm);
+#define mm_forbids_zeropage(X)	vmctx_mm_forbids_zeropage(X)
 #endif
 
 /*

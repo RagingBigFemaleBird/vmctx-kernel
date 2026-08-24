@@ -41,6 +41,7 @@
 
 #include <linux/kernel_stat.h>
 #include <linux/mm.h>
+#include <linux/vmctx.h>
 #include <linux/mm_inline.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/numa_balancing.h>
@@ -4070,6 +4071,45 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 	struct folio *folio = NULL;
 	pte_t pte;
 
+	/*
+	 * Native VM context (avm.md): a write to a page that is present but not
+	 * writable is the third way into a context's memory, and the only one
+	 * with no hook.
+	 *
+	 * It is counted here and nothing else, deliberately. This runs with the
+	 * page-table lock held -- which is why it has never been hooked: asking
+	 * the monitor means sleeping, and sleeping here is not a slow path, it
+	 * is a bug. Answering it properly means unlocking, asking, and retrying
+	 * the fault, and a retry that the monitor did not actually resolve is an
+	 * endless fault. So the size of the hole is measured before anything is
+	 * built on it; see vmctx_wp_fault().
+	 */
+	if (unlikely(current->vmctx || vmf->vma->vm_mm != current->mm)) {
+		/*
+		 * The one case here that would invent memory: the page is the
+		 * shared zero page, so there is nothing to copy and the write
+		 * gets a freshly zeroed one -- for an address whose contents
+		 * may be on another machine. Everything else this function does
+		 * propagates bytes that are already on this side.
+		 *
+		 * Measured before it was refused: over a suite and the page
+		 * tests, do_wp_page() fires about once per run for a context's
+		 * memory and the zero-page case never once, so the guarantee
+		 * "nothing here is invented" is a number rather than an
+		 * argument -- and this keeps it one.
+		 */
+		bool zero = is_zero_pfn(pte_pfn(ptep_get(vmf->pte)));
+		vm_fault_t vret;
+
+		vret = vmctx_wp_fault(vmf->vma->vm_mm, !!current->vmctx,
+				      !!(vma->vm_flags & VM_SHARED),
+				      !!vma->vm_file, zero);
+		if (vret != VM_FAULT_FALLBACK) {
+			pte_unmap_unlock(vmf->pte, vmf->ptl);
+			return vret;
+		}
+	}
+
 	if (likely(!unshare)) {
 		if (userfaultfd_pte_wp(vma, ptep_get(vmf->pte))) {
 			if (!userfaultfd_wp_async(vma)) {
@@ -4516,6 +4556,14 @@ static struct folio *alloc_swap_folio(struct vm_fault *vmf)
 	 * maintain the uffd semantics.
 	 */
 	if (unlikely(userfaultfd_armed(vma)))
+		goto fallback;
+
+	/*
+	 * Native VM context (avm.md): swapping a large folio back in is a
+	 * batch install of its neighbours. One page per fault for a context's
+	 * memory; see finish_fault().
+	 */
+	if (unlikely(vmctx_install_single(vma->vm_mm)))
 		goto fallback;
 
 	/*
@@ -5077,6 +5125,15 @@ static struct folio *alloc_anon_folio(struct vm_fault *vmf)
 		goto fallback;
 
 	/*
+	 * Native VM context (avm.md): a multi-page anonymous folio is a batch
+	 * install too, and for a context's mm the neighbours it zeroes may be
+	 * pages whose current bytes are on the other machine. One page per
+	 * fault; see finish_fault().
+	 */
+	if (unlikely(vmctx_install_single(vma->vm_mm)))
+		goto fallback;
+
+	/*
 	 * Get a list of all the (large) orders below PMD_ORDER that are enabled
 	 * for this vma. Then filter out the orders that can't be allocated over
 	 * the faulting address and still be fully contained in the vma.
@@ -5160,6 +5217,45 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	/* File mapping without ->vm_ops ? */
 	if (vma->vm_flags & VM_SHARED)
 		return VM_FAULT_SIGBUS;
+
+	/*
+	 * Native VM context (avm.md): this task's memory may belong to another
+	 * machine, and a zero page invented here is indistinguishable from it —
+	 * silently, and for good, because the page is present afterwards.
+	 * vmctx_anon_fault() asks the monitor first and falls through for
+	 * memory that really is this machine's.
+	 */
+	if (unlikely(current->vmctx)) {
+		ret = vmctx_anon_fault(vmf);
+		if (ret != VM_FAULT_FALLBACK)
+			return ret;
+		ret = 0;
+	} else if (unlikely(vmf->vma->vm_mm != current->mm)) {
+		/*
+		 * Somebody else's address space, faulted by this task.
+		 *
+		 * The test above asks whether the *faulting task* is a VM
+		 * context. That is the wrong question: what decides whether a
+		 * page may be invented is whose address space it belongs to.
+		 * get_user_pages_remote() -- which is how a monitor reads or
+		 * writes a context's memory, and how ptrace and
+		 * process_vm_readv reach it -- faults the *context's* mm while
+		 * current is the monitor, so the hook does not fire and
+		 * do_anonymous_page() below supplies the page with nobody
+		 * asked and nothing recorded.
+		 *
+		 * Counted rather than acted on. Answering it properly means
+		 * reporting a fault on behalf of a task that is not current,
+		 * which needs an event slot that is not the context's single
+		 * one -- a design change, not a patch. This says how often it
+		 * happens, which is the number that has been missing.
+		 */
+		ret = vmctx_foreign_anon_fault(vmf->vma->vm_mm,
+					       !!(vmf->flags & FAULT_FLAG_WRITE));
+		if (ret != VM_FAULT_FALLBACK)
+			return ret;
+		ret = 0;
+	}
 
 	/*
 	 * Use pte_alloc() instead of pte_alloc_map(), so that OOM can
@@ -5536,6 +5632,24 @@ fallback:
 			file_end < folio_next_index(folio);
 	}
 
+	/*
+	 * Native VM context (avm.md): one page per fault, installed exactly at
+	 * the faulting address, and nothing else.
+	 *
+	 * A context's memory is coherent page by page -- pages change machines
+	 * one at a time, and the owning side's record of who holds what is
+	 * kept per page. The batch installs below (a PMD-sized mapping, a
+	 * large page-cache folio mapped whole) put this side's copy over
+	 * neighbouring pages nobody faulted on -- and for a context a
+	 * neighbour may be a page whose current bytes are on the other
+	 * machine. Once installed it is present, so it never faults again, no
+	 * hook can ever ask about it, and the program reads this side's stale
+	 * copy for the rest of the run. A loader's just-relocated tables
+	 * served back out of the pristine file are the visible case.
+	 */
+	if (unlikely(vmctx_install_single(vma->vm_mm)))
+		needs_fallback = true;
+
 	if (pmd_none(*vmf->pmd)) {
 		if (!needs_fallback && folio_test_pmd_mappable(folio)) {
 			ret = do_set_pmd(vmf, folio, page);
@@ -5703,6 +5817,38 @@ static inline bool should_fault_around(struct vm_fault *vmf)
 	if (!vmf->vma->vm_ops->map_pages)
 		return false;
 
+	/*
+	 * Native VM context (avm.md): never map a page nobody asked for.
+	 *
+	 * Fault-around is a guess that the *faulting task* is about to touch the
+	 * pages next to this one, and it maps them straight out of the page
+	 * cache without a fault each. Neither half of that guess survives here.
+	 *
+	 * A context's memory belongs to the machine the program came from, and
+	 * the monitor moves it one page at a time, taking each page away from
+	 * the other side as it arrives. A page mapped without a fault is a page
+	 * the monitor never heard about: it is present from then on, so this
+	 * side never faults on it again, never asks for it, and never learns
+	 * what the program wrote into it there. Measured on fm1: the monitor
+	 * took the page holding the end of .data away from the context, and the
+	 * very next read of a *neighbouring* page put it back from the file --
+	 * after which a forwarded pread(2) wrote its result into a page both
+	 * machines held, and the program read what it had put there before.
+	 *
+	 * The second test is the same rule stated for the monitor's own
+	 * accesses. When a task faults on an address space that is not its own
+	 * -- a monitor reading a context through GUP, and ptrace or
+	 * process_vm_readv equally -- there is no locality to predict: it asked
+	 * for one range and nothing more. The pages fault-around would add land
+	 * in an address space whose owner never asked for them, which for a
+	 * context is the failure above and everywhere else is an optimisation
+	 * that guessed about the wrong task.
+	 */
+	if (unlikely(current->vmctx))
+		return false;
+	if (unlikely(vmf->vma->vm_mm != current->mm))
+		return false;
+
 	if (uffd_disable_fault_around(vmf->vma))
 		return false;
 
@@ -5839,6 +5985,109 @@ static vm_fault_t do_fault(struct vm_fault *vmf)
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *vm_mm = vma->vm_mm;
 	vm_fault_t ret;
+
+	/*
+	 * Native VM context (avm.md): a *writable private* file mapping is the
+	 * one file-backed range whose contents can stop being the file's.
+	 *
+	 * The program's instructions run on another machine, and its stores
+	 * into such a range happen there. Filling the page from the file here
+	 * would answer with what the program started with rather than what it
+	 * has since written -- a static binary's .data, measured at five or six
+	 * pages a run, held on both machines at once and differing.
+	 *
+	 * Read-only private mappings (text, rodata) and shared ones are not
+	 * asked about: the first cannot diverge, and the second is the file, so
+	 * the file is the right answer for both. That distinction is why this
+	 * is not simply the anonymous hook widened to every fault -- a program's
+	 * text would otherwise be fetched across a network it never needed to
+	 * cross.
+	 */
+	/*
+	 * Every PRIVATE file mapping, not only the writable ones -- and the
+	 * question is separate from the answer, which is what widening this
+	 * kept getting wrong.
+	 *
+	 * The old condition also required VM_WRITE, so a read-only private
+	 * mapping was served from this side's copy of the file, unasked. That
+	 * is where a loader keeps the strings it is about to hand to a
+	 * syscall, and a page of such a mapping that was handed over while the
+	 * mapping was still writable (a loader relocates, then mprotects --
+	 * RELRO) comes back from the file unrelocated: a forwarded openat()
+	 * returns ENOENT for a file that exists. Measured on Firefox.
+	 *
+	 * Widening the condition alone was also measured, and it fails the
+	 * other way (6 of 69): the monitor answered every fault by fetching
+	 * from the other machine, and for the ordinary case -- text and rodata
+	 * this side never handed over, which the other machine does not hold
+	 * -- that ended in 4096 zeros poked over the program's own constants.
+	 *
+	 * So the class goes WITH the question (VMCTX_PGC_* in the event), and
+	 * the monitor decides from its own hand-over record: never handed
+	 * over -> answer SELF and the file below serves it, exactly as before
+	 * and almost as cheaply; handed over -> pull the current bytes from
+	 * the machine that has them. The optimisation lives in the answer, not
+	 * in whether the question is asked.
+	 *
+	 * VM_SHARED stays excluded, and NOT as an optimisation. vmctx_back_fault()
+	 * maps the context's backing object with vm_mmap(bf, ..., MAP_SHARED), so
+	 * on the destination *every* guest page is a shared file mapping of that
+	 * memfd. Asking the monitor about those asks it about the very memory it
+	 * has just supplied: the module backs the page, this hook redirects, the
+	 * monitor pokes, and it faults again. A context must never be asked
+	 * about its own backing object, because that mapping IS the answer.
+	 * (Shared mappings of the program's own making have their coherence
+	 * elsewhere: the owner's reclaim walks them around every forwarded
+	 * call -- see vmhome's sh_file machinery.)
+	 */
+	/*
+	 * ...and the fault this function has never had a case for: a FILE fault
+	 * on somebody ELSE'S address space. The test below asks current->vmctx,
+	 * which is the wrong task when a monitor reads a context's memory
+	 * through get_user_pages_remote(). On a destination that is the whole of
+	 * a guest's memory, because it is all MAP_SHARED off the backing memfd.
+	 * Counted here; see vmctx_foreign_file_fault().
+	 */
+	if (unlikely(vma->vm_mm != current->mm) && vma->vm_file) {
+		ret = vmctx_foreign_file_fault(vma->vm_mm,
+					       !!(vmf->flags & FAULT_FLAG_WRITE),
+					       !!(vma->vm_flags & VM_SHARED),
+					       vma->vm_file->f_mapping,
+					       vmf->pgoff);
+		if (ret != VM_FAULT_FALLBACK)
+			return ret;
+		ret = 0;
+	}
+	if (unlikely(current->vmctx) && vma->vm_file &&
+	    !(vma->vm_flags & VM_SHARED) &&
+	    (vmctx_fault_ro_file || (vma->vm_flags & VM_WRITE))) {
+		ret = vmctx_anon_fault(vmf);
+		if (ret != VM_FAULT_FALLBACK)
+			return ret;
+	}
+	/*
+	 * The case the test above excludes -- shared file mappings -- and it is
+	 * excluded correctly, which was measured rather than assumed.
+	 *
+	 * A guest address space on the destination is the backing object mapped
+	 * MAP_SHARED into every context, so it looked as though every fault on a
+	 * program's own memory would land here with VM_SHARED set, be refused
+	 * the monitor, fall through to shmem, and be answered from a hole with a
+	 * freshly allocated zero page -- which is exactly what tests/pg2.c
+	 * reports when it fails.
+	 *
+	 * It does not happen. A counter here, with pr_warn on the first
+	 * occurrences, fired zero times across four pg2 runs including three
+	 * failing ones, against a control of 153 other vmctx messages reaching
+	 * dmesg in the same runs and the string present in the built vmlinux.
+	 *
+	 * Because a guest's memory faults never come through here at all. The
+	 * program's instructions run in a hardware guest, so a missing page is a
+	 * nested page fault taken as a VMEXIT and handled by the backend, which
+	 * reports it to the monitor. The host fault path sees the *monitor's*
+	 * accesses, not the guest's. Left as a note because the reasoning above
+	 * is the obvious one and someone will have it again.
+	 */
 
 	/*
 	 * The VMA was not fully populated on mmap() or missing VM_DONTEXPAND
@@ -6275,6 +6524,7 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 	pgd_t *pgd;
 	p4d_t *p4d;
 	vm_fault_t ret;
+	bool ctx_single;
 
 	pgd = pgd_offset(mm, address);
 	p4d = p4d_alloc(mm, pgd, address);
@@ -6284,8 +6534,20 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 	vmf.pud = pud_alloc(mm, p4d, address);
 	if (!vmf.pud)
 		return VM_FAULT_OOM;
+	/*
+	 * Native VM context (avm.md): no huge-page short-cuts for a context's
+	 * memory. A PMD or PUD fault installs (or zeroes) hundreds of pages
+	 * nobody faulted on, and -- worse -- the anonymous PMD path answers
+	 * the fault entirely below do_anonymous_page(), so the monitor is
+	 * never asked at all: memory whose current bytes may be on another
+	 * machine would be invented here in 2 MiB units. Falling through to
+	 * the PTE level keeps every fault one page and every page asked
+	 * about. See vmctx_install_single().
+	 */
+	ctx_single = vmctx_install_single(mm);
+
 retry_pud:
-	if (pud_none(*vmf.pud) &&
+	if (pud_none(*vmf.pud) && !ctx_single &&
 	    thp_vma_allowable_order(vma, vm_flags, TVA_PAGEFAULT, PUD_ORDER)) {
 		ret = create_huge_pud(&vmf);
 		if (!(ret & VM_FAULT_FALLBACK))
@@ -6319,7 +6581,7 @@ retry_pud:
 	if (pud_trans_unstable(vmf.pud))
 		goto retry_pud;
 
-	if (pmd_none(*vmf.pmd) &&
+	if (pmd_none(*vmf.pmd) && !ctx_single &&
 	    thp_vma_allowable_order(vma, vm_flags, TVA_PAGEFAULT, PMD_ORDER)) {
 		ret = create_huge_pmd(&vmf);
 		if (!(ret & VM_FAULT_FALLBACK))
@@ -6497,6 +6759,15 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 	ret = sanitize_fault_flags(vma, &flags);
 	if (ret)
 		goto out;
+
+	/*
+	 * Every fault on a VM context's memory, counted where they all pass
+	 * through; the hooks count the ones a monitor is actually asked about.
+	 * The difference is the faults nobody was asked about, which is the
+	 * number a per-path audit cannot produce.
+	 */
+	if (unlikely(atomic_read(&vmctx_nr_active)))
+		vmctx_fault_seen(vma, flags);
 
 	if (!arch_vma_access_permitted(vma, flags & FAULT_FLAG_WRITE,
 					    flags & FAULT_FLAG_INSTRUCTION,
